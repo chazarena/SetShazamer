@@ -211,6 +211,9 @@ class SetShazamerApp(ctk.CTk):
         if sys.platform == "darwin":
             # Files dropped on the Dock icon / "Open With".
             self.createcommand("::tk::mac::OpenDocument", self._on_mac_open)
+            # Cmd-Q / Quit from the Dock or AppleScript, which otherwise skip the
+            # "a scan is running" question and end the scan silently.
+            self.createcommand("::tk::mac::Quit", self._on_close)
 
         self.after(50, self._poll)
         self.after(250, self._preflight)
