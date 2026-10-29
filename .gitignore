@@ -1,0 +1,24 @@
+# Build output
+.build/
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Local exports and test media
+*.csv
+*.mp3
+*.mp4
+*.m4a
+*.wav
+*.flac
+*.mkv
