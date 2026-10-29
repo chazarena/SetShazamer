@@ -28,35 +28,76 @@ def test_track_key_same_track(a, b, same):
     assert TrackKey.of(*a).same_track(TrackKey.of(*b)) is same
 
 
+def _lines(events):
+    return [(type(e).__name__, e.entry.display_line if hasattr(e, "entry") else e.uid) for e in events]
+
+
 def test_builder_dedupes_and_logs_gaps():
     builder = TracklistBuilder(gap_threshold=2)
-    results = [
-        builder.add_match(TrackEntry(0, "Fisher", "Losing It")),
-        builder.add_match(TrackEntry(90, "FISHER", "Losing It (Extended)")),
-        builder.add_match(TrackEntry(180, "Chris Lake", "Turn Off The Lights")),
-        builder.add_miss(270),
-        builder.add_miss(360),
-        builder.add_miss(450),
-        builder.add_match(TrackEntry(540, "Disclosure", "Latch")),
-    ]
-    logged = [r.display_line if r else None for r in results]
-    assert logged == [
+    builder.add_match(TrackEntry(0, "Fisher", "Losing It"))
+    assert _lines(builder.add_match(TrackEntry(90, "FISHER", "Losing It (Extended)"))) == [
+        ("TrackUpdatedEvent", "[00:00:00] | Fisher - Losing It")]
+    builder.add_match(TrackEntry(180, "Chris Lake", "Turn Off The Lights"))
+    assert builder.add_miss(270) == []
+    assert _lines(builder.add_miss(360)) == [("TrackEvent", "[00:04:30] | ID - Unidentified")]
+    assert builder.add_miss(450) == []
+    builder.add_match(TrackEntry(540, "Disclosure", "Latch"))
+    assert [e.display_line for e in builder.entries] == [
         "[00:00:00] | Fisher - Losing It",
-        None,
         "[00:03:00] | Chris Lake - Turn Off The Lights",
-        None,
         "[00:04:30] | ID - Unidentified",
-        None,
         "[00:09:00] | Disclosure - Latch",
     ]
+    assert [e.hits for e in builder.entries] == [2, 1, 1, 1]
+    assert [e.confidence for e in builder.entries] == ["High", "Medium", "", "Medium"]
+    assert len({e.uid for e in builder.entries}) == 4
     assert builder.identified_count == 3
 
 
-def test_single_miss_is_not_a_gap():
-    builder = TracklistBuilder(gap_threshold=2)
-    assert builder.add_miss(0) is None
-    builder.add_match(TrackEntry(90, "A", "B"))
-    assert builder.add_miss(180) is None
+def test_version_and_year_variants_merge():
+    builder = TracklistBuilder()
+    builder.add_match(TrackEntry(90, "Hot'n'Juicy & Mousse T.", "Horny ('98 Radio Edit)"))
+    events = builder.add_match(TrackEntry(180, "Mousse T. & Hot 'n' Juicy",
+                                          "Horny '98 (Extended Mix) [Mixed] [Mixed]"))
+    assert [type(e).__name__ for e in events] == ["TrackUpdatedEvent"]
+    assert len(builder.entries) == 1 and builder.entries[0].hits == 2
+
+
+def test_misfire_between_same_track_is_removed():
+    builder = TracklistBuilder()
+    builder.add_match(TrackEntry(0, "Bicep", "Glue"))
+    misfire = builder.add_match(TrackEntry(90, "Someone", "Wrong Song"))[0].entry
+    events = builder.add_match(TrackEntry(180, "Bicep", "Glue (Original Mix)"))
+    assert _lines(events) == [("TrackRemovedEvent", misfire.uid),
+                              ("TrackUpdatedEvent", "[00:00:00] | Bicep - Glue")]
+    assert [e.title for e in builder.entries] == ["Glue"]
+
+
+def test_confirmed_track_between_is_kept():
+    builder = TracklistBuilder()
+    builder.add_match(TrackEntry(0, "Bicep", "Glue"))
+    b = builder.add_match(TrackEntry(90, "Overmono", "So U Kno"))[0].entry
+    builder.verify(b.uid, TrackEntry(120, "Overmono", "So U Kno"))
+    builder.add_match(TrackEntry(180, "Bicep", "Glue"))
+    assert [e.title for e in builder.entries] == ["Glue", "So U Kno", "Glue"]
+
+
+def test_verify_outcomes():
+    builder = TracklistBuilder()
+    a = builder.add_match(TrackEntry(0, "Bicep", "Glue"))[0].entry
+    (event,) = builder.verify(a.uid, TrackEntry(30, "BICEP", "Glue"))
+    assert event.entry.confidence == "High" and event.entry.verified is True
+    b = builder.add_match(TrackEntry(90, "Overmono", "So U Kno"))[0].entry
+    (event,) = builder.verify(b.uid, TrackEntry(120, "Peggy Gou", "Nanana"))
+    assert event.entry.confidence == "Low" and event.entry.verified is False
+    # A later regular slice agreeing overrides the failed double-check.
+    builder.add_match(TrackEntry(180, "Overmono", "So U Kno"))
+    assert builder.entries[-1].confidence == "High"
+
+
+def test_clean_title_drops_mixed_tags():
+    assert scanner.clean_title("Horny '98 (Extended Mix) [Mixed] [Mixed]") == "Horny '98 (Extended Mix)"
+    assert scanner.clean_title("[Mixed]") == "[Mixed]"
 
 
 SHAZAM_RESPONSE = {
@@ -175,3 +216,73 @@ def test_download_rejects_non_links(tmp_path):
 
     with pytest.raises(DownloadError):
         download_audio("not a url", tmp_path)
+
+
+def _fake_response(artist, title):
+    return {"matches": [{}], "track": {"title": title, "subtitle": artist}}
+
+
+def test_scan_double_checks_new_tracks(monkeypatch):
+    """Full scan loop with ffmpeg and Shazam faked out."""
+    plan = {  # slice start -> what Shazam "hears"
+        0: ("Bicep", "Glue"), 30: ("Bicep", "Glue"),
+        90: ("Overmono", "So U Kno"), 120: ("Peggy Gou", "Nanana"),
+        180: ("Fisher", "Losing It"), 210: None,
+        270: ("Fisher", "Losing It"),
+    }
+    asked = []
+
+    async def fake_probe(_path):
+        return 300.0
+
+    async def fake_extract(_path, start, _length=12):
+        return f"{start:.0f}".encode()
+
+    async def fake_recognize(self, data, *args, **kwargs):
+        asked.append(int(data))
+        heard = plan.get(int(data))
+        return _fake_response(*heard) if heard else {"matches": []}
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(scanner, "probe_duration", fake_probe)
+    monkeypatch.setattr(scanner, "extract_slice", fake_extract)
+    monkeypatch.setattr(scanner.Shazam, "recognize", fake_recognize)
+    monkeypatch.setattr(scanner.asyncio, "sleep", no_sleep)
+
+    events = []
+    config = scanner.ScanConfig("mix.mp3", step_seconds=90)
+    entries = asyncio.run(scanner.TracklistScanner(config, events.append).run())
+
+    assert asked == [0, 30, 90, 120, 180, 210, 270]
+    assert [(e.title, e.confidence, e.hits) for e in entries] == [
+        ("Glue", "High", 2), ("So U Kno", "Low", 1), ("Losing It", "High", 2)]
+    assert any(isinstance(e, scanner.TrackUpdatedEvent) for e in events)
+
+
+def test_scan_without_double_check(monkeypatch):
+    async def fake_probe(_path):
+        return 200.0
+
+    async def fake_extract(_path, start, _length=12):
+        return f"{start:.0f}".encode()
+
+    asked = []
+
+    async def fake_recognize(self, data, *args, **kwargs):
+        asked.append(int(data))
+        return _fake_response("Bicep", "Glue")
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(scanner, "probe_duration", fake_probe)
+    monkeypatch.setattr(scanner, "extract_slice", fake_extract)
+    monkeypatch.setattr(scanner.Shazam, "recognize", fake_recognize)
+    monkeypatch.setattr(scanner.asyncio, "sleep", no_sleep)
+
+    config = scanner.ScanConfig("mix.mp3", step_seconds=90, verify=False)
+    entries = asyncio.run(scanner.TracklistScanner(config, lambda e: None).run())
+    assert asked == [0, 90, 180]
+    assert [(e.title, e.hits) for e in entries] == [("Glue", 3)]

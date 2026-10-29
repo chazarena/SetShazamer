@@ -41,6 +41,8 @@ from scanner import (  # noqa: E402
     StatusEvent,
     TrackEntry,
     TrackEvent,
+    TrackRemovedEvent,
+    TrackUpdatedEvent,
     format_duration,
 )
 from downloader import (  # noqa: E402
@@ -63,6 +65,7 @@ APP_NAME = "SetShazamer"
 NEW_PLAYLIST = "+ New playlist…"
 NO_PLAYLISTS = "(connect Spotify)"
 CHECKED, UNCHECKED, NO_CHECK = "☑", "☐", ""
+CONFIDENCE_LABELS = {"High": "●●● High", "Medium": "●●○ Med", "Low": "●○○ Low"}
 
 if sys.platform == "darwin":
     MONO_FAMILY = "Menlo"
@@ -175,11 +178,12 @@ class SetShazamerApp(ctk.CTk):
 
         self.filepath: str | None = None
         self.worker: ScanWorker | None = None
+        # Rows are keyed by TrackEntry.uid, which stays put while confidence changes.
         self.entries: list[TrackEntry] = []
         self.checked: set[int] = set()
-        self.spotify_status: dict[TrackEntry, str] = {}
-        self.spotify_matches: dict[TrackEntry, SpotifyTrack | None] = {}
-        self._iid_of: dict[TrackEntry, str] = {}
+        self._touched: set[int] = set()  # Rows the user ticked/unticked by hand.
+        self.spotify_status: dict[int, str] = {}
+        self.spotify_matches: dict[int, SpotifyTrack | None] = {}
 
         self.scan_events: queue.Queue[ScanEvent] = queue.Queue()
         self.ui_calls: queue.Queue[Callable[[], None]] = queue.Queue()
@@ -197,6 +201,7 @@ class SetShazamerApp(ctk.CTk):
 
         self.step_var = tk.IntVar(value=DEFAULT_STEP_SECONDS)
         self.show_id_var = tk.BooleanVar(value=False)
+        self.verify_var = tk.BooleanVar(value=True)
         self.skip_dupes_var = tk.BooleanVar(value=True)
         self.playlist_var = tk.StringVar(value=NO_PLAYLISTS)
 
@@ -244,15 +249,18 @@ class SetShazamerApp(ctk.CTk):
         self.step_slider = ctk.CTkSlider(
             config, from_=MIN_STEP_SECONDS, to=MAX_STEP_SECONDS,
             number_of_steps=(MAX_STEP_SECONDS - MIN_STEP_SECONDS) // 10,
-            variable=self.step_var, command=self._on_step_change, width=260)
+            variable=self.step_var, command=self._on_step_change, width=200)
         self.step_slider.grid(row=0, column=1, pady=12)
         self.step_label = ctk.CTkLabel(config, text=f"{DEFAULT_STEP_SECONDS}s", width=48, anchor="w")
         self.step_label.grid(row=0, column=2, padx=8, sticky="w")
+        self.verify_box = ctk.CTkCheckBox(config, text="Double-check new tracks",
+                                          variable=self.verify_var)
+        self.verify_box.grid(row=0, column=3, padx=(12, 6))
         ctk.CTkCheckBox(config, text="Show Unidentified [ID - ID]", variable=self.show_id_var,
-                        command=self._rebuild_tree).grid(row=0, column=3, padx=12)
+                        command=self._rebuild_tree).grid(row=0, column=4, padx=(6, 12))
         self.scan_btn = ctk.CTkButton(config, text="Start Scan", width=140,
                                       font=ctk.CTkFont(weight="bold"), command=self._toggle_scan)
-        self.scan_btn.grid(row=0, column=4, padx=12, pady=12)
+        self.scan_btn.grid(row=0, column=5, padx=12, pady=12)
         self._scan_btn_colors = (self.scan_btn.cget("fg_color"), self.scan_btn.cget("hover_color"))
 
         # 3. Telemetry
@@ -275,7 +283,7 @@ class SetShazamerApp(ctk.CTk):
         results.grid_columnconfigure(0, weight=1)
         results.grid_rowconfigure(0, weight=1)
         self._style_tree(mono)
-        columns = ("check", "time", "artist", "title", "label", "spotify")
+        columns = ("check", "time", "artist", "title", "label", "confidence", "spotify")
         self.tree = ttk.Treeview(results, columns=columns, show="headings",
                                  selectmode="browse", style="Shazamer.Treeview")
         for col, text, width, stretch, anchor in (
@@ -284,12 +292,14 @@ class SetShazamerApp(ctk.CTk):
             ("artist", "Artist", 230, True, "w"),
             ("title", "Title", 290, True, "w"),
             ("label", "Label", 170, True, "w"),
+            ("confidence", "Confidence", 104, False, "w"),
             ("spotify", "Spotify", 130, False, "w"),
         ):
             self.tree.heading(col, text=text, anchor=anchor)
             self.tree.column(col, width=width, minwidth=30, stretch=stretch, anchor=anchor)
         self.tree.heading("check", text=CHECKED, command=self._toggle_all)
         self.tree.tag_configure("unidentified", foreground="#7f8c8d")
+        self.tree.tag_configure("low", foreground="#e59866")
         self.tree.tag_configure("odd", background="#202224")
         self.tree.grid(row=0, column=0, padx=(8, 0), pady=8, sticky="nsew")
         scroll = ctk.CTkScrollbar(results, command=self.tree.yview)
@@ -385,7 +395,7 @@ class SetShazamerApp(ctk.CTk):
     def _update_counts(self) -> None:
         n = self._identified_count()
         self.count_label.configure(text=f"{n} unique track{'s' if n != 1 else ''} found")
-        selected = sum(1 for i in self.checked if not self.entries[i].unidentified)
+        selected = sum(1 for e in self.entries if e.uid in self.checked and not e.unidentified)
         self.add_btn.configure(text=f"Add Selected ({selected})" if selected else "Add Selected")
 
     # ---------------------------------------------------------- file/scan ---
@@ -474,7 +484,7 @@ class SetShazamerApp(ctk.CTk):
 
     def _set_downloading(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
-        for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider):
+        for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider, self.verify_box):
             widget.configure(state=state)
         if busy:
             self.scan_btn.configure(state="normal", text="Cancel Download",
@@ -541,6 +551,7 @@ class SetShazamerApp(ctk.CTk):
 
         self.entries.clear()
         self.checked.clear()
+        self._touched.clear()
         self.spotify_status.clear()
         self.spotify_matches.clear()
         self._rebuild_tree()
@@ -549,12 +560,13 @@ class SetShazamerApp(ctk.CTk):
         self._scan_started = time.monotonic()
         self._last_remaining = None
 
-        config = ScanConfig(self.filepath, step_seconds=int(round(self.step_var.get())))
+        config = ScanConfig(self.filepath, step_seconds=int(round(self.step_var.get())),
+                            verify=self.verify_var.get())
         self.worker = ScanWorker(config, self.scan_events)
         self.worker.start()
         log.info("Scan started: %s (step %ss)", self.filepath, config.step_seconds)
         self.scan_btn.configure(text="Stop Scan", fg_color=ACCENT_RED, hover_color=ACCENT_RED_HOVER)
-        for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider):
+        for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider, self.verify_box):
             widget.configure(state="disabled")
 
     def _handle_scan_event(self, event: ScanEvent) -> None:
@@ -568,12 +580,16 @@ class SetShazamerApp(ctk.CTk):
             self._set_status(event.message, warn=True)
         elif isinstance(event, TrackEvent):
             self._append_entry(event.entry)
+        elif isinstance(event, TrackUpdatedEvent):
+            self._update_entry(event.entry)
+        elif isinstance(event, TrackRemovedEvent):
+            self._remove_entry(event.uid)
         elif isinstance(event, FinishedEvent):
             self.worker = None
             self.scan_btn.configure(state="normal", text="Start Scan",
                                     fg_color=self._scan_btn_colors[0],
                                     hover_color=self._scan_btn_colors[1])
-            for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider):
+            for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider, self.verify_box):
                 widget.configure(state="normal")
             if event.reason == "completed":
                 self.progress.set(1)
@@ -598,68 +614,103 @@ class SetShazamerApp(ctk.CTk):
 
     # -------------------------------------------------------------- table ---
 
-    def _row_values(self, index: int) -> tuple[str, ...]:
-        entry = self.entries[index]
-        if entry.unidentified:
-            return (NO_CHECK, entry.timestamp, "ID", "Unidentified", "", "")
-        check = CHECKED if index in self.checked else UNCHECKED
-        label = entry.label if entry.has_label else ""
-        return (check, entry.timestamp, entry.artist, entry.title, label,
-                self.spotify_status.get(entry, ""))
+    def _entry(self, uid: int) -> TrackEntry | None:
+        return next((e for e in self.entries if e.uid == uid), None)
 
-    def _insert_row(self, index: int) -> None:
-        entry = self.entries[index]
-        tags = ["odd"] if len(self.tree.get_children()) % 2 else []
+    def _row_values(self, entry: TrackEntry) -> tuple[str, ...]:
+        if entry.unidentified:
+            return (NO_CHECK, entry.timestamp, "ID", "Unidentified", "", "", "")
+        check = CHECKED if entry.uid in self.checked else UNCHECKED
+        label = entry.label if entry.has_label else ""
+        confidence = CONFIDENCE_LABELS.get(entry.confidence, entry.confidence)
+        return (check, entry.timestamp, entry.artist, entry.title, label, confidence,
+                self.spotify_status.get(entry.uid, ""))
+
+    def _row_tags(self, entry: TrackEntry, odd: bool) -> list[str]:
+        tags = ["odd"] if odd else []
         if entry.unidentified:
             tags.append("unidentified")
-        iid = str(index)
-        self.tree.insert("", "end", iid=iid, values=self._row_values(index), tags=tags)
-        self._iid_of[entry] = iid
+        elif entry.confidence == "Low":
+            tags.append("low")
+        return tags
+
+    def _insert_row(self, entry: TrackEntry) -> None:
+        odd = len(self.tree.get_children()) % 2 == 1
+        self.tree.insert("", "end", iid=str(entry.uid), values=self._row_values(entry),
+                         tags=self._row_tags(entry, odd))
+
+    def _refresh_row(self, entry: TrackEntry) -> None:
+        iid = str(entry.uid)
+        if self.tree.exists(iid):
+            odd = "odd" in self.tree.item(iid, "tags")
+            self.tree.item(iid, values=self._row_values(entry), tags=self._row_tags(entry, odd))
+
+    def _auto_check(self, entry: TrackEntry) -> None:
+        """Tick likely-correct tracks; leave the ones the user set by hand alone."""
+        if entry.unidentified or entry.uid in self._touched:
+            return
+        if entry.confidence == "Low":
+            self.checked.discard(entry.uid)
+        else:
+            self.checked.add(entry.uid)
 
     def _append_entry(self, entry: TrackEntry) -> None:
         self.entries.append(entry)
-        index = len(self.entries) - 1
-        if not entry.unidentified:
-            self.checked.add(index)
+        self._auto_check(entry)
         if self.show_id_var.get() or not entry.unidentified:
             at_bottom = self.tree.yview()[1] >= 0.999
-            self._insert_row(index)
+            self._insert_row(entry)
             if at_bottom:
-                self.tree.see(str(index))
+                self.tree.see(str(entry.uid))
         self._update_counts()
+
+    def _update_entry(self, entry: TrackEntry) -> None:
+        for i, existing in enumerate(self.entries):
+            if existing.uid == entry.uid:
+                self.entries[i] = entry
+                break
+        else:
+            return
+        self._auto_check(entry)
+        self._refresh_row(entry)
+        self._update_counts()
+
+    def _remove_entry(self, uid: int) -> None:
+        self.entries = [e for e in self.entries if e.uid != uid]
+        for store in (self.checked, self._touched):
+            store.discard(uid)
+        self.spotify_status.pop(uid, None)
+        self._rebuild_tree()  # Re-stripes the rows.
 
     def _rebuild_tree(self) -> None:
+        top = self.tree.yview()[0]
         self.tree.delete(*self.tree.get_children())
-        self._iid_of.clear()
         show_id = self.show_id_var.get()
-        for index, entry in enumerate(self.entries):
+        for entry in self.entries:
             if show_id or not entry.unidentified:
-                self._insert_row(index)
+                self._insert_row(entry)
+        self.tree.yview_moveto(top)
         self._update_counts()
 
-    def _refresh_row(self, index: int) -> None:
-        iid = str(index)
-        if self.tree.exists(iid):
-            self.tree.item(iid, values=self._row_values(index))
-
-    def _toggle_index(self, index: int) -> None:
-        if self.entries[index].unidentified:
+    def _toggle_uid(self, uid: int) -> None:
+        entry = self._entry(uid)
+        if entry is None or entry.unidentified:
             return
-        if index in self.checked:
-            self.checked.discard(index)
+        if uid in self.checked:
+            self.checked.discard(uid)
         else:
-            self.checked.add(index)
-        self._refresh_row(index)
+            self.checked.add(uid)
+        self._touched.add(uid)
+        self._refresh_row(entry)
         self._update_counts()
 
     def _toggle_all(self) -> None:
-        identified = [i for i, e in enumerate(self.entries) if not e.unidentified]
-        if all(i in self.checked for i in identified):
-            self.checked.clear()
-        else:
-            self.checked.update(identified)
-        for i in identified:
-            self._refresh_row(i)
+        identified = [e for e in self.entries if not e.unidentified]
+        tick = not all(e.uid in self.checked for e in identified)
+        for entry in identified:
+            (self.checked.add if tick else self.checked.discard)(entry.uid)
+            self._touched.add(entry.uid)
+            self._refresh_row(entry)
         self._update_counts()
 
     def _on_tree_click(self, event: tk.Event) -> None:
@@ -667,21 +718,21 @@ class SetShazamerApp(ctk.CTk):
             return
         row = self.tree.identify_row(event.y)
         if row:
-            self._toggle_index(int(row))
+            self._toggle_uid(int(row))
 
     def _on_tree_space(self, _event: tk.Event) -> str:
         row = self.tree.focus()
         if row:
-            self._toggle_index(int(row))
+            self._toggle_uid(int(row))
         return "break"
 
     def _on_tree_double(self, event: tk.Event) -> None:
         row = self.tree.identify_row(event.y)
-        if not row:
+        entry = self._entry(int(row)) if row else None
+        if entry is None:
             return
         # The two clicks of a double-click toggle the box twice, leaving it as it was.
-        entry = self.entries[int(row)]
-        match = self.spotify_matches.get(entry)
+        match = self.spotify_matches.get(entry.uid)
         url = (match.url if match else "") or entry.shazam_url or entry.apple_music_url
         if url:
             webbrowser.open(url)
@@ -744,13 +795,15 @@ class SetShazamerApp(ctk.CTk):
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as fh:
                 writer = csv.writer(fh)
-                writer.writerow(["Timestamp", "Seconds", "Artist", "Title", "Label", "Album",
-                                 "ISRC", "Apple Music URL", "Spotify URI", "Shazam URL"])
+                writer.writerow(["Timestamp", "Seconds", "Artist", "Title", "Label", "Confidence",
+                                 "Times Heard", "Album", "ISRC", "Apple Music URL", "Spotify URI",
+                                 "Shazam URL"])
                 for entry in self._visible_entries():
-                    match = self.spotify_matches.get(entry)
+                    match = self.spotify_matches.get(entry.uid)
                     writer.writerow([
                         entry.timestamp, int(entry.seconds),
                         entry.artist, entry.title, entry.label if not entry.unidentified else "",
+                        entry.confidence, entry.hits if not entry.unidentified else "",
                         entry.album, entry.isrc, entry.apple_music_url,
                         match.uri if match else entry.spotify_uri, entry.shazam_url,
                     ])
@@ -886,9 +939,9 @@ class SetShazamerApp(ctk.CTk):
                      self._spotify_failed)
 
     def _set_spotify_status(self, entry: TrackEntry, text: str) -> None:
-        self.spotify_status[entry] = text
-        iid = self._iid_of.get(entry)
-        if iid is not None and self.tree.exists(iid):
+        self.spotify_status[entry.uid] = text
+        iid = str(entry.uid)
+        if self.tree.exists(iid):
             self.tree.set(iid, "spotify", text)
 
     def _add_to_spotify(self) -> None:
@@ -901,7 +954,7 @@ class SetShazamerApp(ctk.CTk):
             else:
                 messagebox.showinfo(APP_NAME, "Choose a playlist first.", parent=self)
             return
-        picked = [self.entries[i] for i in sorted(self.checked) if not self.entries[i].unidentified]
+        picked = [e for e in self.entries if e.uid in self.checked and not e.unidentified]
         if not picked:
             messagebox.showinfo(APP_NAME, "Tick the tracks you want to add first.", parent=self)
             return
@@ -917,10 +970,10 @@ class SetShazamerApp(ctk.CTk):
             to_add: list[tuple[TrackEntry, str]] = []
             counts = {"added": 0, "duplicate": 0, "missing": 0}
             for entry in picked:
-                if entry not in matches:
+                if entry.uid not in matches:
                     self._call_ui(lambda e=entry: self._set_spotify_status(e, "Searching…"))
-                    matches[entry] = self.spotify.find_track(entry)
-                match = matches[entry]
+                    matches[entry.uid] = self.spotify.find_track(entry)
+                match = matches[entry.uid]
                 if match is None:
                     counts["missing"] += 1
                     self._call_ui(lambda e=entry: self._set_spotify_status(e, "Not found"))
@@ -950,7 +1003,7 @@ class SetShazamerApp(ctk.CTk):
 
         def failed(exc: BaseException) -> None:
             for entry in picked:
-                if self.spotify_status.get(entry) in ("Searching…", "Matched"):
+                if self.spotify_status.get(entry.uid) in ("Searching…", "Matched"):
                     self._set_spotify_status(entry, "Error")
             self._spotify_failed(exc)
 

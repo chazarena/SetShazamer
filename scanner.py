@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -52,6 +52,8 @@ MAX_STEP_SECONDS = 180
 DEFAULT_STEP_SECONDS = 90
 MIN_TAIL_SECONDS = 4.0  # A final slice shorter than this can't be fingerprinted.
 GAP_THRESHOLD = 2  # Consecutive empty slices before an "ID" row is logged.
+VERIFY_OFFSET_SECONDS = 30  # Where the double-check listens, after a new track is heard.
+VERIFY_MIN_STEP_SECONDS = 45  # Below this the regular slices already overlap enough.
 
 JITTER_RANGE = (1.2, 1.8)
 MAX_RETRIES = 3
@@ -177,6 +179,20 @@ class TrackEntry:
     spotify_uri: str = ""
     shazam_url: str = ""
     unidentified: bool = False
+    uid: int = 0  # Stable identity while hits/verified change.
+    hits: int = 1  # Slices (including double-checks) that matched this track.
+    verified: bool | None = None  # Double-check outcome; None when none ran.
+
+    @property
+    def confidence(self) -> str:
+        """High: heard 2+ times. Low: the double-check heard something else."""
+        if self.unidentified:
+            return ""
+        if self.hits >= 2:
+            return "High"
+        if self.verified is False:
+            return "Low"
+        return "Medium"
 
     @property
     def timestamp(self) -> str:
@@ -200,6 +216,7 @@ class ScanConfig:
     step_seconds: int = DEFAULT_STEP_SECONDS
     slice_seconds: int = SLICE_SECONDS
     gap_threshold: int = GAP_THRESHOLD
+    verify: bool = True
 
     def __post_init__(self) -> None:
         if not MIN_STEP_SECONDS <= self.step_seconds <= MAX_STEP_SECONDS:
@@ -229,6 +246,20 @@ class TrackEvent:
 
 
 @dataclass(frozen=True)
+class TrackUpdatedEvent:
+    """Same ``uid`` as an earlier entry; replaces it (hit count / confidence changed)."""
+
+    entry: TrackEntry
+
+
+@dataclass(frozen=True)
+class TrackRemovedEvent:
+    """A one-off misfire sandwiched inside another track was dropped."""
+
+    uid: int
+
+
+@dataclass(frozen=True)
 class StatusEvent:
     message: str
 
@@ -241,7 +272,8 @@ class FinishedEvent:
     elapsed: float
 
 
-ScanEvent = ProgressEvent | TrackEvent | StatusEvent | FinishedEvent
+ScanEvent = (ProgressEvent | TrackEvent | TrackUpdatedEvent | TrackRemovedEvent
+             | StatusEvent | FinishedEvent)
 
 
 # --------------------------------------------------------------------------- #
@@ -273,11 +305,19 @@ def _walk_uris(node: Any) -> Iterator[str]:
             yield from _walk_uris(value)
 
 
+_MIXED_TAG = re.compile(r"\s*[\[(]\s*mixed\s*[\])]", re.IGNORECASE)
+
+
+def clean_title(title: str) -> str:
+    """Drop the "[Mixed]" tags DJ-mix compilations add, often more than once."""
+    return _SPACES.sub(" ", _MIXED_TAG.sub("", title)).strip() or title.strip()
+
+
 def parse_track(response: dict[str, Any], seconds: float) -> TrackEntry | None:
     track = response.get("track")
     if not response.get("matches") or not isinstance(track, dict):
         return None
-    title = (track.get("title") or "").strip()
+    title = clean_title(track.get("title") or "")
     artist = (track.get("subtitle") or "").strip()
     if not title:
         return None
@@ -317,6 +357,11 @@ _ARTIST_SPLIT = re.compile(
 )
 _NON_WORD = re.compile(r"[^\w\s]+")
 _SPACES = re.compile(r"\s+")
+# Words that name a release version rather than the song.
+_VERSION_WORDS = frozenset(
+    "radio edit extended original mix club version remaster remastered remix vip dub "
+    "rework mixed instrumental intro outro short long".split()
+)
 
 
 def _clean(text: str) -> str:
@@ -327,11 +372,13 @@ def _clean(text: str) -> str:
 
 
 def normalize_title(title: str) -> str:
-    """"Song (feat. X) [Extended Mix] - Remastered 2011" -> "song"."""
+    """"Song '98 (feat. X) [Extended Mix] - Remastered 2011" -> "song"."""
     base = _FEAT_INLINE.sub("", title)
     base = _BRACKETED.sub(" ", base)
     base = _DASH_SUFFIX.sub("", base)
-    return _clean(base) or _clean(title)
+    words = _clean(base).split()
+    core = [w for w in words if not w.isdigit() and w not in _VERSION_WORDS]
+    return " ".join(core or words) or _clean(title)
 
 
 def artist_names(artist: str) -> frozenset[str]:
@@ -352,25 +399,37 @@ class TrackKey:
             artists=artist_names(artist),
         )
 
-    def same_track(self, other: "TrackKey") -> bool:
-        if self.raw == other.raw:
-            return True
-        if self.title != other.title and SequenceMatcher(None, self.title, other.title).ratio() < 0.88:
-            return False
-        if not self.artists or not other.artists or self.artists & other.artists:
+    def _artists_match(self, other: "TrackKey") -> bool:
+        if self.artists & other.artists:
             return True
         mine = " ".join(sorted(self.artists))
         theirs = " ".join(sorted(other.artists))
         return SequenceMatcher(None, mine, theirs).ratio() >= 0.9
 
+    def same_track(self, other: "TrackKey") -> bool:
+        if self.raw == other.raw:
+            return True
+        no_artists = not self.artists or not other.artists
+        artists = no_artists or self._artists_match(other)
+        if self.title == other.title or SequenceMatcher(None, self.title, other.title).ratio() >= 0.88:
+            return artists
+        # "horny" vs "horny 98 extended": one title's words inside the other's.
+        mine, theirs = set(self.title.split()), set(other.title.split())
+        return (not no_artists and artists and bool(mine) and bool(theirs)
+                and (mine <= theirs or theirs <= mine))
+
 
 class TracklistBuilder:
-    """Turns a stream of per-slice results into transition-only entries."""
+    """Turns a stream of per-slice results into transition-only entries.
+
+    Every method returns the events describing what changed, so the GUI can
+    mirror the list without re-reading it.
+    """
 
     def __init__(self, gap_threshold: int = GAP_THRESHOLD) -> None:
         self.gap_threshold = max(1, gap_threshold)
         self.entries: list[TrackEntry] = []
-        self._last_key: TrackKey | None = None
+        self._next_uid = 1
         self._miss_run = 0
         self._miss_run_start = 0.0
         self._gap_logged = False
@@ -379,28 +438,66 @@ class TracklistBuilder:
     def identified_count(self) -> int:
         return sum(1 for entry in self.entries if not entry.unidentified)
 
-    def add_match(self, entry: TrackEntry) -> TrackEntry | None:
+    def _uid(self) -> int:
+        uid, self._next_uid = self._next_uid, self._next_uid + 1
+        return uid
+
+    def _identified_indexes(self) -> list[int]:
+        return [i for i, entry in enumerate(self.entries) if not entry.unidentified]
+
+    def _bump(self, index: int, **changes: Any) -> TrackUpdatedEvent:
+        entry = self.entries[index]
+        self.entries[index] = replace(entry, hits=entry.hits + 1, **changes)
+        return TrackUpdatedEvent(self.entries[index])
+
+    def add_match(self, entry: TrackEntry) -> list[ScanEvent]:
         self._miss_run = 0
         self._gap_logged = False
         key = TrackKey.of(entry.artist, entry.title)
-        if self._last_key is not None and self._last_key.same_track(key):
-            return None
-        self._last_key = key
-        self.entries.append(entry)
-        return entry
+        identified = self._identified_indexes()
 
-    def add_miss(self, seconds: float) -> TrackEntry | None:
+        if identified:
+            last = identified[-1]
+            if TrackKey.of(self.entries[last].artist, self.entries[last].title).same_track(key):
+                return [self._bump(last)]
+
+            # A, B, A where B was heard once and nothing sits between them:
+            # B was a misfire inside A, so drop it and count it toward A.
+            if (len(identified) >= 2 and last == len(self.entries) - 1
+                    and identified[-2] == last - 1 and self.entries[last].hits == 1):
+                before = self.entries[last - 1]
+                if TrackKey.of(before.artist, before.title).same_track(key):
+                    misfire = self.entries.pop(last)
+                    return [TrackRemovedEvent(misfire.uid), self._bump(last - 1)]
+
+        new = replace(entry, uid=self._uid(), hits=1, verified=None)
+        self.entries.append(new)
+        return [TrackEvent(new)]
+
+    def add_miss(self, seconds: float) -> list[ScanEvent]:
         if self._miss_run == 0:
             self._miss_run_start = seconds
         self._miss_run += 1
         if self._miss_run < self.gap_threshold or self._gap_logged:
-            return None
+            return []
         self._gap_logged = True
-        gap = TrackEntry(
-            seconds=self._miss_run_start, artist="ID", title="Unidentified", unidentified=True
-        )
+        gap = TrackEntry(seconds=self._miss_run_start, artist="ID", title="Unidentified",
+                         unidentified=True, uid=self._uid())
         self.entries.append(gap)
-        return gap
+        return [TrackEvent(gap)]
+
+    def verify(self, uid: int, heard: TrackEntry) -> list[ScanEvent]:
+        """Record what the double-check heard for the entry ``uid``."""
+        index = next((i for i, e in enumerate(self.entries) if e.uid == uid), None)
+        if index is None:
+            return []
+        entry = self.entries[index]
+        if TrackKey.of(entry.artist, entry.title).same_track(TrackKey.of(heard.artist, heard.title)):
+            return [self._bump(index, verified=True)]
+        if entry.hits >= 2:
+            return []
+        self.entries[index] = replace(entry, verified=False)
+        return [TrackUpdatedEvent(self.entries[index])]
 
 
 # --------------------------------------------------------------------------- #
@@ -591,6 +688,25 @@ class TracklistScanner:
                 await asyncio.sleep(delay)
         return None
 
+    def _can_verify(self, position: float, duration: float) -> bool:
+        return (self.config.verify
+                and self.config.step_seconds >= VERIFY_MIN_STEP_SECONDS
+                and position + VERIFY_OFFSET_SECONDS + MIN_TAIL_SECONDS < duration)
+
+    async def _verify(self, shazam: Shazam, entry: TrackEntry, at: float) -> None:
+        """Listen again a little later; agreement promotes the track to High confidence."""
+        audio, _ = await asyncio.gather(
+            self._extract_or_none(at),
+            asyncio.sleep(random.uniform(*JITTER_RANGE) + self.cooldown),
+        )
+        self._check_cancel()
+        response = await self._recognize(shazam, audio, at) if audio else None
+        heard = parse_track(response, at) if response else None
+        # Silence or a blend proves nothing either way; only a match is evidence.
+        if heard is not None:
+            for event in self.builder.verify(entry.uid, heard):
+                self.emit(event)
+
     async def run(self) -> tuple[TrackEntry, ...]:
         self.started = time.monotonic()
         self._check_cancel()
@@ -617,9 +733,15 @@ class TracklistScanner:
                     self.failed_slices += 1
                 else:
                     match = parse_track(response, position)
-                    added = self.builder.add_match(match) if match else self.builder.add_miss(position)
-                    if added is not None:
-                        self.emit(TrackEvent(added))
+                    events = self.builder.add_match(match) if match else self.builder.add_miss(position)
+                    for event in events:
+                        self.emit(event)
+                    new = next((e.entry for e in events
+                                if isinstance(e, TrackEvent) and not e.entry.unidentified), None)
+                    if new is not None and self._can_verify(position, duration):
+                        self._progress(index, total, position, duration,
+                                       f"Double-checking {format_timestamp(position + VERIFY_OFFSET_SECONDS)}")
+                        await self._verify(shazam, new, position + VERIFY_OFFSET_SECONDS)
 
                 status = f"Scanned {stamp}"
                 if index + 1 < total:
@@ -712,6 +834,8 @@ def _cli() -> int:
     parser.add_argument("--step", type=int, default=DEFAULT_STEP_SECONDS,
                         help=f"seconds between slices ({MIN_STEP_SECONDS}-{MAX_STEP_SECONDS})")
     parser.add_argument("--show-id", action="store_true", help="print unidentified gaps")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="skip the double-check of each new track (faster, less reliable)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -735,20 +859,23 @@ def _cli() -> int:
         print(f"  .. saved to {source}", file=sys.stderr)
 
     events: queue.Queue[ScanEvent] = queue.Queue()
-    worker = ScanWorker(ScanConfig(source, step_seconds=args.step), events)
+    worker = ScanWorker(ScanConfig(source, step_seconds=args.step, verify=not args.no_verify), events)
     worker.start()
     try:
         while True:
             event = events.get()
-            if isinstance(event, TrackEvent):
-                if args.show_id or not event.entry.unidentified:
-                    print(event.entry.display_line, flush=True)
+            if isinstance(event, TrackEvent) and not event.entry.unidentified:
+                print(f"  .. found {event.entry.display_line}", file=sys.stderr, flush=True)
             elif isinstance(event, StatusEvent):
                 print(f"  .. {event.message}", file=sys.stderr, flush=True)
             elif isinstance(event, ProgressEvent):
                 print(f"  {event.fraction:6.1%}  {event.status}  (eta {format_duration(event.remaining)})",
                       file=sys.stderr, flush=True)
             elif isinstance(event, FinishedEvent):
+                for entry in event.entries:
+                    if args.show_id or not entry.unidentified:
+                        tag = f"  [{entry.confidence}]" if entry.confidence else ""
+                        print(entry.display_line + tag, flush=True)
                 print(event.message, file=sys.stderr)
                 return 0 if event.reason != "error" else 1
     except KeyboardInterrupt:

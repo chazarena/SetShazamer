@@ -23,7 +23,10 @@ into one row per track, and gives you a clean tracklist:
 - **Handles long, heavy files.** Audio is decoded slice by slice through ffmpeg pipes, so
   it never loads the whole file into memory or writes temp files. Video files work too.
 - **One row per track.** Repeat matches of the same song are merged, including
-  "Original Mix" / "Extended Mix" / "feat." variants. The timestamp is where the track starts.
+  "Original Mix" / "Extended Mix" / "Radio Edit" / "'98" / "feat." / "[Mixed]" variants.
+  The timestamp is where the track starts. A one-off misfire in the middle of another track
+  (A → B → A) is removed.
+- **Confidence for every track.** See [How sure is each ID?](#how-sure-is-each-id) below.
 - **Optional ID rows.** Two or more unrecognised slices in a row show up as `ID - Unidentified`,
   which usually means an unreleased track or a long blend.
 - **Metadata:** artist, title, label, album, ISRC, plus Apple Music, Spotify and Shazam links.
@@ -105,6 +108,29 @@ On Linux: `sudo apt install ffmpeg python3-tk`.
 5. Export with **Copy to Clipboard**, **Export .TXT** or **Export .CSV**.
    **Show Unidentified** decides whether ID rows are included.
 
+### How sure is each ID?
+
+Shazam doesn't return a confidence score. It does report how far a match is sped up
+or pitch-shifted, but DJs routinely play tracks a few percent off speed, so that number
+isn't reliable inside a mix. SetShazamer measures agreement instead: a track Shazam hears
+in two separate places is almost certainly right, while most false IDs only appear once.
+
+| Confidence | Meaning | Ticked for Spotify? |
+|---|---|---|
+| ●●● **High** | Heard in 2 or more places | Yes |
+| ●●○ **Med** | Heard once; the double-check heard nothing usable (silence or a heavy blend), or was off | Yes |
+| ●○○ **Low** | Heard once, and the double-check 30 s later heard a *different* song | No, and the row is dimmed |
+
+**Double-check new tracks** (on by default) listens again 30 seconds after each newly
+found track. That costs one extra Shazam lookup per track, roughly a third more scan
+time. It's skipped at intervals under 45 s, where the regular slices already overlap.
+A track's confidence goes up whenever a later slice hears it again. The CSV export
+includes **Confidence** and **Times Heard** columns.
+
+Tips for fewer wrong IDs: use a shorter interval (60 s) for fast-mixing sets, and
+treat **Low** rows as "probably the track underneath a blend". A Low row is often right
+about the artist and wrong about the exact track.
+
 ### How long does a scan take?
 
 Shazam limits how fast one internet connection can send lookups: a few come back
@@ -113,9 +139,11 @@ gets rate-limited and speeds back up when lookups succeed. Rough guide:
 
 | Mix length | Interval | Slices | Typical time |
 |-----------:|---------:|-------:|-------------:|
-| 1 h        | 90 s     | 40     | 6–14 min     |
-| 2.5 h      | 90 s     | 100    | 15–35 min    |
-| 2.5 h      | 60 s     | 150    | 25–50 min    |
+| 1 h        | 90 s     | 40     | 8–18 min     |
+| 2.5 h      | 90 s     | 100    | 20–45 min    |
+| 2.5 h      | 60 s     | 150    | 30–60 min    |
+
+Times include the double-check. Turn it off for roughly a third less.
 
 Now and then a slice still fails after 3 retries. It is skipped, and the status bar
 says how many were.
@@ -161,7 +189,7 @@ Unreleased IDs and white labels usually aren't on Spotify, so they show **Not fo
 The scan engine also runs without the GUI:
 
 ```bash
-python scanner.py "My Mix.mp3" --step 90 --show-id
+python scanner.py "My Mix.mp3" --step 90 --show-id      # add --no-verify to skip double-checks
 python scanner.py "https://soundcloud.com/artist/some-mix"   # downloads first
 python downloader.py "https://www.youtube.com/watch?v=…"     # download only
 ```
