@@ -2,7 +2,8 @@
 
 **Turn a long DJ mix into a timestamped tracklist, then send the tracks you like to a Spotify playlist.**
 
-Drop in a 2-hour set (`.mp3`, `.mp4`, `.m4a`, `.wav`, `.flac` or `.mkv`). SetShazamer
+Drop in a 2-hour set (`.mp3`, `.mp4`, `.m4a`, `.wav`, `.flac`, `.mkv`…), or paste a
+**YouTube or SoundCloud link** and let SetShazamer download it as an MP3. SetShazamer
 fingerprints a short slice every 30–180 seconds with Shazam, merges the repeat matches
 into one row per track, and gives you a clean tracklist:
 
@@ -17,6 +18,8 @@ into one row per track, and gives you a clean tracklist:
 
 ## Features
 
+- **Paste a link.** YouTube and SoundCloud links (and most other sites [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+  supports) are downloaded as MP3 to `~/Music/SetShazamer`, then scanned automatically.
 - **Handles long, heavy files.** Audio is decoded slice by slice through ffmpeg pipes, so
   it never loads the whole file into memory or writes temp files. Video files work too.
 - **One row per track.** Repeat matches of the same song are merged, including
@@ -85,8 +88,13 @@ On Linux: `sudo apt install ffmpeg python3-tk`.
 
 ## Using it
 
-1. Click **Open Mix…** and pick your file. On a Mac you can also drop the file on the
-   Dock icon or use **Open With → SetShazamer**.
+1. Either:
+   - click **Open Mix…** and pick a file. On a Mac you can also drop the file on the
+     Dock icon or use **Open With → SetShazamer**, or
+   - paste a YouTube or SoundCloud link into the box under it and click **Download & Scan**
+     (or press Return). The MP3 is saved to `~/Music/SetShazamer`, and the scan starts as soon
+     as the download finishes. **Cancel Download** stops it partway through. Pasting a link
+     you've already downloaded reuses the saved file.
 2. Choose a **Scan Interval**. 90 s is a good default; use 60 s for fast-mixing sets
    and 120–180 s for long blends.
 3. Click **Start Scan**. Tracks appear as they're found.
@@ -154,6 +162,8 @@ The scan engine also runs without the GUI:
 
 ```bash
 python scanner.py "My Mix.mp3" --step 90 --show-id
+python scanner.py "https://soundcloud.com/artist/some-mix"   # downloads first
+python downloader.py "https://www.youtube.com/watch?v=…"     # download only
 ```
 
 The tracklist goes to stdout and progress to stderr. Ctrl-C stops cleanly.
@@ -170,6 +180,9 @@ The tracklist goes to stdout and progress to stderr. Ctrl-C stops cleanly.
 | Spotify: "INVALID_CLIENT: Invalid redirect URI" | The redirect URI in your Spotify app must be exactly `http://127.0.0.1:8888/callback` (not `localhost`, no trailing slash). |
 | Spotify: 403 / "refused the request" | The developer app's owner needs Premium, and the account you signed in with must be listed under **User Management**. |
 | Spotify: "Port 8888 is busy" | Another program is using port 8888. Quit it and try again. |
+| A YouTube or SoundCloud link fails to download | Sites change often. If you built from source, run `pip install -U "yt-dlp[default]"` and rebuild. If you use the release download, grab the newest release. For YouTube, installing [Deno](https://deno.com) (`brew install deno`) or Node.js also helps, because yt-dlp uses it to unlock some formats. |
+| "That link is a playlist or set" | Open the single track or mix and copy that link instead of the playlist's. |
+| Private or members-only video, or a "registered users" SoundCloud track | These need a signed-in account, which SetShazamer doesn't support. Download the file yourself and use **Open Mix…**. |
 | Many tracks show "Not found" | Usually unreleased IDs or edits. Check the CSV: tracks with an ISRC match much more reliably. |
 
 Logs: `~/Library/Logs/SetShazamer/setshazamer.log` on macOS, or the `logs` folder inside
@@ -207,6 +220,9 @@ Delete that file, or click **Disconnect**, to sign out.
   out the rate-limit pause, it already decodes the next slice. It retries 429s and timeouts
   with exponential backoff and an adaptive cooldown, and merges matches with a normalised
   title/artist comparison.
+- **[downloader.py](downloader.py):** yt-dlp fetches the best audio stream and FFmpeg converts it
+  to 192 kbps MP3. Progress and cancellation are wired to the GUI. Playlists are refused, and
+  links you've already downloaded are reused.
 - **[spotify.py](spotify.py):** Authorization Code with PKCE (no client secret), with
   token refresh. Uses the post-February-2026 endpoints (`POST /me/playlists`,
   `/playlists/{id}/items`).
@@ -230,7 +246,9 @@ The tests run offline. The ffmpeg pipeline test is skipped if ffmpeg isn't insta
 SetShazamer isn't affiliated with or endorsed by Shazam, Apple or Spotify. Track
 recognition goes through [shazamio](https://github.com/shazamio/ShazamIO), an unofficial
 client for Shazam's API, and may stop working if Shazam changes it. Only short
-fingerprints are sent, never the audio itself. Use it for personal tracklisting and
+fingerprints are sent, never the audio itself. Only download mixes you have the right
+to download (for example your own sets, or ones the uploader allows to be downloaded), and
+follow the terms of the site you're downloading from. Use it for personal tracklisting and
 respect the artists: buy the music you find.
 
 ## License

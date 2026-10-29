@@ -10,7 +10,7 @@ set -euo pipefail
 
 APP_NAME="SetShazamer"
 BUNDLE_ID="com.setshazamer.app"
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 cd "$(dirname "$0")"
 ROOT="$PWD"
@@ -77,6 +77,7 @@ ICON_ARGS=()
   --collect-all shazamio \
   --collect-all shazamio_core \
   --collect-submodules aiohttp \
+  --collect-all yt_dlp_ejs \
   --hidden-import darkdetect \
   --paths "$ROOT" \
   --distpath "$DIST" \

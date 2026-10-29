@@ -44,7 +44,7 @@ from shazamio import (
 
 log = logging.getLogger("setshazamer.scanner")
 
-SUPPORTED_EXTENSIONS = (".mp3", ".mp4", ".wav", ".m4a", ".flac", ".mkv")
+SUPPORTED_EXTENSIONS = (".mp3", ".mp4", ".wav", ".m4a", ".flac", ".mkv", ".webm", ".ogg", ".opus", ".aac")
 
 SLICE_SECONDS = 12  # Shazam's own window; 15 s and up returns no matches.
 MIN_STEP_SECONDS = 30
@@ -708,7 +708,7 @@ def _close_loop(loop: asyncio.AbstractEventLoop) -> None:
 
 def _cli() -> int:
     parser = argparse.ArgumentParser(description="Extract a timestamped tracklist from a mix.")
-    parser.add_argument("file")
+    parser.add_argument("file", help="audio/video file, or a YouTube / SoundCloud link")
     parser.add_argument("--step", type=int, default=DEFAULT_STEP_SECONDS,
                         help=f"seconds between slices ({MIN_STEP_SECONDS}-{MAX_STEP_SECONDS})")
     parser.add_argument("--show-id", action="store_true", help="print unidentified gaps")
@@ -720,8 +720,22 @@ def _cli() -> int:
         print(f"Missing {', '.join(missing)}. Install FFmpeg: brew install ffmpeg", file=sys.stderr)
         return 2
 
+    source = args.file
+    if source.startswith(("http://", "https://")):
+        from downloader import DownloadCancelled, DownloadError, download_audio
+
+        try:
+            source = str(download_audio(
+                source, on_progress=lambda p: print(f"  .. {p.message}", file=sys.stderr, flush=True)))
+        except (DownloadError, DownloadCancelled) as exc:
+            print(f"Download failed: {exc}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            return 130
+        print(f"  .. saved to {source}", file=sys.stderr)
+
     events: queue.Queue[ScanEvent] = queue.Queue()
-    worker = ScanWorker(ScanConfig(args.file, step_seconds=args.step), events)
+    worker = ScanWorker(ScanConfig(source, step_seconds=args.step), events)
     worker.start()
     try:
         while True:

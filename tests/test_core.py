@@ -151,3 +151,27 @@ def test_ffmpeg_pipeline(tmp_path):
     assert audio[:4] == b"RIFF" and audio[8:12] == b"WAVE"
     # 12 s of 16 kHz mono 16-bit PCM, plus the header.
     assert abs(len(audio) - (44 + 12 * 16000 * 2)) < 2000
+
+
+@pytest.mark.parametrize(
+    "text, ok",
+    [
+        ("https://www.youtube.com/watch?v=aqz-KE-bpKQ", True),
+        ("https://soundcloud.com/artist/some-mix", True),
+        ("  https://youtu.be/abc  ", True),
+        ("youtube.com/watch?v=abc", False),
+        ("not a url", False),
+        ("/Users/me/mix.mp3", False),
+    ],
+)
+def test_is_url(text, ok):
+    from downloader import is_url
+
+    assert is_url(text) is ok
+
+
+def test_download_rejects_non_links(tmp_path):
+    from downloader import DownloadError, download_audio
+
+    with pytest.raises(DownloadError):
+        download_audio("not a url", tmp_path)

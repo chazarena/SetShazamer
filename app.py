@@ -43,6 +43,12 @@ from scanner import (  # noqa: E402
     TrackEvent,
     format_duration,
 )
+from downloader import (  # noqa: E402
+    DownloadCancelled,
+    DownloadProgress,
+    download_audio,
+    is_url,
+)
 from spotify import (  # noqa: E402
     DASHBOARD_URL,
     SETUP_STEPS,
@@ -187,6 +193,7 @@ class SetShazamerApp(ctk.CTk):
         self._last_remaining: float | None = None
         self._last_progress_at = 0.0
         self._ffmpeg_ok = True
+        self._download_cancel: threading.Event | None = None
 
         self.step_var = tk.IntVar(value=DEFAULT_STEP_SECONDS)
         self.show_id_var = tk.BooleanVar(value=False)
@@ -221,7 +228,13 @@ class SetShazamerApp(ctk.CTk):
         self.file_label = ctk.CTkLabel(
             header, anchor="w", text_color=MUTED_TEXT,
             text="No file selected  ·  " + " ".join(SUPPORTED_EXTENSIONS))
-        self.file_label.grid(row=0, column=1, padx=(0, 12), sticky="ew")
+        self.file_label.grid(row=0, column=1, columnspan=2, padx=(0, 12), sticky="ew")
+        self.url_entry = ctk.CTkEntry(header, placeholder_text="…or paste a YouTube / SoundCloud link")
+        self.url_entry.grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 12), sticky="ew")
+        self.url_entry.bind("<Return>", lambda _e: self._download_from_link())
+        self.download_btn = ctk.CTkButton(header, text="Download & Scan", width=150,
+                                          command=self._download_from_link)
+        self.download_btn.grid(row=1, column=2, padx=(0, 12), pady=(0, 12))
 
         # 2. Configuration
         config = ctk.CTkFrame(self)
@@ -421,7 +434,89 @@ class SetShazamerApp(ctk.CTk):
     def _on_step_change(self, value: float) -> None:
         self.step_label.configure(text=f"{int(round(value))}s")
 
+    # ----------------------------------------------------------- download ---
+
+    def _download_from_link(self) -> None:
+        if self.worker is not None or self._download_cancel is not None:
+            return
+        url = self.url_entry.get().strip()
+        if not url:
+            messagebox.showinfo(APP_NAME, "Paste a YouTube or SoundCloud link first.", parent=self)
+            return
+        if not is_url(url):
+            messagebox.showerror(APP_NAME, "That doesn't look like a link. Paste the full URL, "
+                                 "starting with https://", parent=self)
+            return
+        if not self._ffmpeg_ok:
+            self._preflight()
+            return
+
+        cancel = threading.Event()
+        self._download_cancel = cancel
+        self._set_downloading(True)
+        self.progress.set(0)
+        self.pct_label.configure(text="")
+        self.time_label.configure(text="")
+        log.info("Download started: %s", url)
+
+        def on_progress(progress: DownloadProgress) -> None:
+            self._call_ui(lambda: self._show_download_progress(progress))
+
+        def job() -> None:
+            try:
+                path = download_audio(url, on_progress=on_progress, cancel=cancel)
+            except BaseException as exc:  # Reported on the Tk thread, never swallowed.
+                self._call_ui(lambda e=exc: self._download_finished(None, e))
+                return
+            self._call_ui(lambda: self._download_finished(path, None))
+
+        threading.Thread(target=job, name="download", daemon=True).start()
+
+    def _set_downloading(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider):
+            widget.configure(state=state)
+        if busy:
+            self.scan_btn.configure(state="normal", text="Cancel Download",
+                                    fg_color=ACCENT_RED, hover_color=ACCENT_RED_HOVER)
+        else:
+            self.scan_btn.configure(state="normal", text="Start Scan",
+                                    fg_color=self._scan_btn_colors[0],
+                                    hover_color=self._scan_btn_colors[1])
+
+    def _show_download_progress(self, progress: DownloadProgress) -> None:
+        if self._download_cancel is None:
+            return
+        if progress.fraction is not None:
+            self.progress.set(progress.fraction)
+            self.pct_label.configure(text=f"{progress.fraction:.0%}")
+        self._set_status(progress.message)
+
+    def _download_finished(self, path: Path | None, error: BaseException | None) -> None:
+        cancelled = self._download_cancel is not None and self._download_cancel.is_set()
+        self._download_cancel = None
+        self._set_downloading(False)
+        if error is not None or cancelled or path is None:
+            self.progress.set(0)
+            self.pct_label.configure(text="0%")
+            if cancelled or isinstance(error, DownloadCancelled):
+                self._set_status("Download cancelled")
+                return
+            log.warning("Download failed: %s", error)
+            self._set_status(f"Download failed: {error}", warn=True)
+            messagebox.showerror("Download failed", str(error), parent=self)
+            return
+        self.url_entry.delete(0, "end")
+        self._set_file(str(path))
+        log.info("Download saved: %s", path)
+        self._start_scan()
+        self._set_status(f"Saved to {path.parent}  ·  starting scan…")
+
     def _toggle_scan(self) -> None:
+        if self._download_cancel is not None:
+            self._download_cancel.set()
+            self.scan_btn.configure(state="disabled", text="Cancelling…")
+            return
         if self.worker is None:
             self._start_scan()
         else:
@@ -432,6 +527,9 @@ class SetShazamerApp(ctk.CTk):
     def _start_scan(self) -> None:
         if not self._ffmpeg_ok:
             self._preflight()
+            return
+        if not self.filepath and self.url_entry.get().strip():
+            self._download_from_link()
             return
         if not self.filepath:
             self._choose_file()
@@ -456,8 +554,8 @@ class SetShazamerApp(ctk.CTk):
         self.worker.start()
         log.info("Scan started: %s (step %ss)", self.filepath, config.step_seconds)
         self.scan_btn.configure(text="Stop Scan", fg_color=ACCENT_RED, hover_color=ACCENT_RED_HOVER)
-        self.open_btn.configure(state="disabled")
-        self.step_slider.configure(state="disabled")
+        for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider):
+            widget.configure(state="disabled")
 
     def _handle_scan_event(self, event: ScanEvent) -> None:
         if isinstance(event, ProgressEvent):
@@ -475,8 +573,8 @@ class SetShazamerApp(ctk.CTk):
             self.scan_btn.configure(state="normal", text="Start Scan",
                                     fg_color=self._scan_btn_colors[0],
                                     hover_color=self._scan_btn_colors[1])
-            self.open_btn.configure(state="normal")
-            self.step_slider.configure(state="normal")
+            for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider):
+                widget.configure(state="normal")
             if event.reason == "completed":
                 self.progress.set(1)
                 self.pct_label.configure(text="100%")
@@ -882,6 +980,8 @@ class SetShazamerApp(ctk.CTk):
             self.worker.join(timeout=5)
         if self._auth_cancel is not None:
             self._auth_cancel.set()
+        if self._download_cancel is not None:
+            self._download_cancel.set()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.destroy()
 

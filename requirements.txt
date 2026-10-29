@@ -6,3 +6,12 @@ customtkinter==6.0.0
 darkdetect==0.8.0
 pyinstaller==6.22.3
 pyinstaller-hooks-contrib==2026.9
+yt-dlp[default]==2026.10.26
+yt-dlp-ejs==0.8.0
+brotli==1.2.1
+certifi==2026.10.23
+mutagen==1.48.1
+pycryptodomex==3.24.1
+requests==2.34.2
+urllib3==2.8.0
+websockets==17.3
