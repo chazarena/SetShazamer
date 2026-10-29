@@ -54,6 +54,7 @@ MIN_TAIL_SECONDS = 4.0  # A final slice shorter than this can't be fingerprinted
 GAP_THRESHOLD = 2  # Consecutive empty slices before an "ID" row is logged.
 VERIFY_OFFSET_SECONDS = 30  # Where the double-check listens, after a new track is heard.
 VERIFY_MIN_STEP_SECONDS = 45  # Below this the regular slices already overlap enough.
+RETRY_OFFSET_SECONDS = 30  # On a miss, listen this far back, then this far forward.
 
 JITTER_RANGE = (1.2, 1.8)
 MAX_RETRIES = 3
@@ -217,6 +218,7 @@ class ScanConfig:
     slice_seconds: int = SLICE_SECONDS
     gap_threshold: int = GAP_THRESHOLD
     verify: bool = True
+    retry_misses: bool = True
 
     def __post_init__(self) -> None:
         if not MIN_STEP_SECONDS <= self.step_seconds <= MAX_STEP_SECONDS:
@@ -486,6 +488,12 @@ class TracklistBuilder:
         self.entries.append(gap)
         return [TrackEvent(gap)]
 
+    def repeats_last(self, entry: TrackEntry) -> bool:
+        """Is ``entry`` the most recently identified track?"""
+        last = next((e for e in reversed(self.entries) if not e.unidentified), None)
+        return last is not None and TrackKey.of(last.artist, last.title).same_track(
+            TrackKey.of(entry.artist, entry.title))
+
     def verify(self, uid: int, heard: TrackEntry) -> list[ScanEvent]:
         """Record what the double-check heard for the entry ``uid``."""
         index = next((i for i, e in enumerate(self.entries) if e.uid == uid), None)
@@ -693,15 +701,41 @@ class TracklistScanner:
                 and self.config.step_seconds >= VERIFY_MIN_STEP_SECONDS
                 and position + VERIFY_OFFSET_SECONDS + MIN_TAIL_SECONDS < duration)
 
-    async def _verify(self, shazam: Shazam, entry: TrackEntry, at: float) -> None:
-        """Listen again a little later; agreement promotes the track to High confidence."""
+    def _can_retry(self, position: float, duration: float) -> bool:
+        return (self.config.retry_misses
+                and self.config.step_seconds >= VERIFY_MIN_STEP_SECONDS
+                and (position >= RETRY_OFFSET_SECONDS
+                     or position + RETRY_OFFSET_SECONDS + MIN_TAIL_SECONDS < duration))
+
+    async def _listen(self, shazam: Shazam, at: float) -> TrackEntry | None:
+        """One extra lookup at ``at``, rate-limit pause included."""
         audio, _ = await asyncio.gather(
             self._extract_or_none(at),
             asyncio.sleep(random.uniform(*JITTER_RANGE) + self.cooldown),
         )
         self._check_cancel()
         response = await self._recognize(shazam, audio, at) if audio else None
-        heard = parse_track(response, at) if response else None
+        return parse_track(response, at) if response else None
+
+    async def _retry_miss(self, shazam: Shazam, position: float, duration: float,
+                          report: Callable[[str], None]) -> TrackEntry | None:
+        """30 s back, then 30 s forward. The first new song heard wins."""
+        back = position - RETRY_OFFSET_SECONDS
+        if back >= 0:
+            report(f"No match; trying {format_timestamp(back)}")
+            heard = await self._listen(shazam, back)
+            # Hearing the outgoing track again says nothing about this spot.
+            if heard is not None and not self.builder.repeats_last(heard):
+                return heard
+        forward = position + RETRY_OFFSET_SECONDS
+        if forward + MIN_TAIL_SECONDS < duration:
+            report(f"No match; trying {format_timestamp(forward)}")
+            return await self._listen(shazam, forward)
+        return None
+
+    async def _verify(self, shazam: Shazam, entry: TrackEntry, at: float) -> None:
+        """Listen again a little later; agreement promotes the track to High confidence."""
+        heard = await self._listen(shazam, at)
         # Silence or a blend proves nothing either way; only a match is evidence.
         if heard is not None:
             for event in self.builder.verify(entry.uid, heard):
@@ -732,16 +766,22 @@ class TracklistScanner:
                 if response is None:
                     self.failed_slices += 1
                 else:
+                    def report(status: str, i: int = index, at: float = position) -> None:
+                        self._progress(i, total, at, duration, status)
+
                     match = parse_track(response, position)
+                    if match is None and self._can_retry(position, duration):
+                        match = await self._retry_miss(shazam, position, duration, report)
                     events = self.builder.add_match(match) if match else self.builder.add_miss(position)
                     for event in events:
                         self.emit(event)
                     new = next((e.entry for e in events
                                 if isinstance(e, TrackEvent) and not e.entry.unidentified), None)
-                    if new is not None and self._can_verify(position, duration):
-                        self._progress(index, total, position, duration,
-                                       f"Double-checking {format_timestamp(position + VERIFY_OFFSET_SECONDS)}")
-                        await self._verify(shazam, new, position + VERIFY_OFFSET_SECONDS)
+                    if new is not None and self._can_verify(new.seconds, duration):
+                        # Found 30 s back? The slice itself just missed, so check ahead of it.
+                        check_at = max(new.seconds, position) + VERIFY_OFFSET_SECONDS
+                        report(f"Double-checking {format_timestamp(check_at)}")
+                        await self._verify(shazam, new, check_at)
 
                 status = f"Scanned {stamp}"
                 if index + 1 < total:
@@ -834,6 +874,8 @@ def _cli() -> int:
     parser.add_argument("--step", type=int, default=DEFAULT_STEP_SECONDS,
                         help=f"seconds between slices ({MIN_STEP_SECONDS}-{MAX_STEP_SECONDS})")
     parser.add_argument("--show-id", action="store_true", help="print unidentified gaps")
+    parser.add_argument("--no-retry", action="store_true",
+                        help="on a miss, don't try 30 s back and 30 s forward")
     parser.add_argument("--no-verify", action="store_true",
                         help="skip the double-check of each new track (faster, less reliable)")
     args = parser.parse_args()
@@ -859,7 +901,8 @@ def _cli() -> int:
         print(f"  .. saved to {source}", file=sys.stderr)
 
     events: queue.Queue[ScanEvent] = queue.Queue()
-    worker = ScanWorker(ScanConfig(source, step_seconds=args.step, verify=not args.no_verify), events)
+    worker = ScanWorker(ScanConfig(source, step_seconds=args.step, verify=not args.no_verify,
+                                       retry_misses=not args.no_retry), events)
     worker.start()
     try:
         while True:

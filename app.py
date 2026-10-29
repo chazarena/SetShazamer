@@ -209,6 +209,7 @@ class SetShazamerApp(ctk.CTk):
         self.step_var = tk.IntVar(value=DEFAULT_STEP_SECONDS)
         self.show_id_var = tk.BooleanVar(value=False)
         self.verify_var = tk.BooleanVar(value=True)
+        self.retry_var = tk.BooleanVar(value=True)
         self.skip_dupes_var = tk.BooleanVar(value=True)
         self.playlist_var = tk.StringVar(value=NO_PLAYLISTS)
 
@@ -263,14 +264,20 @@ class SetShazamerApp(ctk.CTk):
         self.step_slider.grid(row=0, column=1, pady=12)
         self.step_label = ctk.CTkLabel(config, text=f"{DEFAULT_STEP_SECONDS}s", width=48, anchor="w")
         self.step_label.grid(row=0, column=2, padx=8, sticky="w")
-        self.verify_box = ctk.CTkCheckBox(config, text="Double-check new tracks",
-                                          variable=self.verify_var)
-        self.verify_box.grid(row=0, column=3, padx=(12, 6))
-        ctk.CTkCheckBox(config, text="Show Unidentified [ID - ID]", variable=self.show_id_var,
-                        command=self._rebuild_tree).grid(row=0, column=4, padx=(6, 12))
         self.scan_btn = ctk.CTkButton(config, text="Start Scan", width=140,
                                       font=ctk.CTkFont(weight="bold"), command=self._toggle_scan)
-        self.scan_btn.grid(row=0, column=5, padx=12, pady=12)
+        self.scan_btn.grid(row=0, column=3, padx=12, pady=12)
+        # Accuracy options sit on their own row so the bar fits at minimum width.
+        options = ctk.CTkFrame(config, fg_color="transparent")
+        options.grid(row=1, column=0, columnspan=4, padx=12, pady=(0, 12), sticky="w")
+        self.verify_box = ctk.CTkCheckBox(options, text="Double-check new tracks",
+                                          variable=self.verify_var)
+        self.verify_box.pack(side="left", padx=(0, 20))
+        self.retry_box = ctk.CTkCheckBox(options, text="On a miss, retry 30s back / 30s forward",
+                                         variable=self.retry_var)
+        self.retry_box.pack(side="left", padx=(0, 20))
+        ctk.CTkCheckBox(options, text="Show Unidentified [ID - ID]", variable=self.show_id_var,
+                        command=self._rebuild_tree).pack(side="left")
         self._scan_btn_colors = (self.scan_btn.cget("fg_color"), self.scan_btn.cget("hover_color"))
 
         # 3. Telemetry
@@ -500,7 +507,7 @@ class SetShazamerApp(ctk.CTk):
 
     def _set_downloading(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
-        for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider, self.verify_box):
+        for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider, self.verify_box, self.retry_box):
             widget.configure(state=state)
         if busy:
             self.scan_btn.configure(state="normal", text="Cancel Download",
@@ -577,12 +584,12 @@ class SetShazamerApp(ctk.CTk):
         self._last_remaining = None
 
         config = ScanConfig(self.filepath, step_seconds=int(round(self.step_var.get())),
-                            verify=self.verify_var.get())
+                            verify=self.verify_var.get(), retry_misses=self.retry_var.get())
         self.worker = ScanWorker(config, self.scan_events)
         self.worker.start()
         log.info("Scan started: %s (step %ss)", self.filepath, config.step_seconds)
         self.scan_btn.configure(text="Stop Scan", fg_color=ACCENT_RED, hover_color=ACCENT_RED_HOVER)
-        for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider, self.verify_box):
+        for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider, self.verify_box, self.retry_box):
             widget.configure(state="disabled")
 
     def _handle_scan_event(self, event: ScanEvent) -> None:
@@ -605,7 +612,7 @@ class SetShazamerApp(ctk.CTk):
             self.scan_btn.configure(state="normal", text="Start Scan",
                                     fg_color=self._scan_btn_colors[0],
                                     hover_color=self._scan_btn_colors[1])
-            for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider, self.verify_box):
+            for widget in (self.open_btn, self.url_entry, self.download_btn, self.step_slider, self.verify_box, self.retry_box):
                 widget.configure(state="normal")
             if event.reason == "completed":
                 self.progress.set(1)

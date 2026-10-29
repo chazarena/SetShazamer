@@ -286,3 +286,74 @@ def test_scan_without_double_check(monkeypatch):
     entries = asyncio.run(scanner.TracklistScanner(config, lambda e: None).run())
     assert asked == [0, 90, 180]
     assert [(e.title, e.hits) for e in entries] == [("Glue", 3)]
+
+
+def _run_plan(monkeypatch, plan, duration, **config):
+    """Run the scan loop against a fixed {second: (artist, title) | None} plan."""
+    asked = []
+
+    async def fake_probe(_path):
+        return duration
+
+    async def fake_extract(_path, start, _length=12):
+        return f"{start:.0f}".encode()
+
+    async def fake_recognize(self, data, *args, **kwargs):
+        asked.append(int(data))
+        heard = plan.get(int(data))
+        return _fake_response(*heard) if heard else {"matches": []}
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(scanner, "probe_duration", fake_probe)
+    monkeypatch.setattr(scanner, "extract_slice", fake_extract)
+    monkeypatch.setattr(scanner.Shazam, "recognize", fake_recognize)
+    monkeypatch.setattr(scanner.asyncio, "sleep", no_sleep)
+    cfg = scanner.ScanConfig("mix.mp3", step_seconds=90, **config)
+    entries = asyncio.run(scanner.TracklistScanner(cfg, lambda e: None).run())
+    return asked, entries
+
+
+def test_miss_retries_back_then_forward(monkeypatch):
+    plan = {
+        0: ("Bicep", "Glue"),
+        90: None,                       # miss...
+        60: ("Bicep", "Glue"),          # ...30 s back only re-hears the outgoing track
+        120: ("Overmono", "So U Kno"),  # ...30 s forward finds the new one
+        180: ("Overmono", "So U Kno"),
+    }
+    asked, entries = _run_plan(monkeypatch, plan, 200.0, verify=False)
+    assert asked == [0, 90, 60, 120, 180]
+    assert [(e.timestamp, e.title, e.hits) for e in entries] == [
+        ("00:00:00", "Glue", 1), ("00:02:00", "So U Kno", 2)]
+
+
+def test_miss_found_going_back_skips_forward(monkeypatch):
+    plan = {0: ("Bicep", "Glue"), 90: None, 60: ("Fisher", "Losing It"), 180: ("Fisher", "Losing It")}
+    asked, entries = _run_plan(monkeypatch, plan, 200.0, verify=False)
+    assert asked == [0, 90, 60, 180]
+    assert [(e.timestamp, e.title) for e in entries] == [("00:00:00", "Glue"), ("00:01:00", "Losing It")]
+
+
+def test_miss_with_nothing_either_side_moves_on(monkeypatch):
+    plan = {0: ("Bicep", "Glue")}
+    asked, entries = _run_plan(monkeypatch, plan, 290.0, verify=False)
+    # 90: back 60, forward 120. 180: back 150, forward 210. 270: back 240 only (no room ahead).
+    assert asked == [0, 90, 60, 120, 180, 150, 210, 270, 240]
+    assert [e.title for e in entries] == ["Glue", "Unidentified"]
+
+
+def test_retry_can_be_turned_off(monkeypatch):
+    plan = {0: ("Bicep", "Glue")}
+    asked, _ = _run_plan(monkeypatch, plan, 200.0, verify=False, retry_misses=False)
+    assert asked == [0, 90, 180]
+
+
+def test_track_found_by_retry_is_double_checked_ahead(monkeypatch):
+    plan = {0: ("Bicep", "Glue"), 30: ("Bicep", "Glue"), 90: None,
+            60: ("Fisher", "Losing It"), 120: ("Fisher", "Losing It"), 180: ("Fisher", "Losing It")}
+    asked, entries = _run_plan(monkeypatch, plan, 200.0)
+    # The double-check for a track found 30 s back listens past the missed slice (120, not 90).
+    assert asked == [0, 30, 90, 60, 120, 180]
+    assert [(e.title, e.confidence) for e in entries] == [("Glue", "High"), ("Losing It", "High")]

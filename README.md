@@ -26,6 +26,8 @@ into one row per track, and gives you a clean tracklist:
   "Original Mix" / "Extended Mix" / "Radio Edit" / "'98" / "feat." / "[Mixed]" variants.
   The timestamp is where the track starts. A one-off misfire in the middle of another track
   (A → B → A) is removed.
+- **Retries on a miss.** If a slice finds nothing, it tries 30 s earlier, then 30 s later,
+  before moving on.
 - **Confidence for every track.** See [How sure is each ID?](#how-sure-is-each-id) below.
 - **Optional ID rows.** Two or more unrecognised slices in a row show up as `ID - Unidentified`,
   which usually means an unreleased track or a long blend.
@@ -127,6 +129,12 @@ time. It's skipped at intervals under 45 s, where the regular slices already ove
 A track's confidence goes up whenever a later slice hears it again. The CSV export
 includes **Confidence** and **Times Heard** columns.
 
+**On a miss, retry 30s back / 30s forward** (on by default): when a slice finds nothing,
+SetShazamer listens 30 s earlier. If that hears a new song, it's logged at that time.
+If it only hears the previous track still playing, it tries 30 s later. Only if both come up
+empty does it move on (and log an ID row after two misses in a row). Each miss costs up to two
+extra lookups. Like the double-check, it's skipped at intervals under 45 s.
+
 Tips for fewer wrong IDs: use a shorter interval (60 s) for fast-mixing sets, and
 treat **Low** rows as "probably the track underneath a blend". A Low row is often right
 about the artist and wrong about the exact track.
@@ -143,7 +151,8 @@ gets rate-limited and speeds back up when lookups succeed. Rough guide:
 | 2.5 h      | 90 s     | 100    | 20–45 min    |
 | 2.5 h      | 60 s     | 150    | 30–60 min    |
 
-Times include the double-check. Turn it off for roughly a third less.
+Times include the double-check and miss retries. Turning both off saves roughly a third
+or more, depending on how many slices miss.
 
 Now and then a slice still fails after 3 retries. It is skipped, and the status bar
 says how many were.
@@ -189,7 +198,7 @@ Unreleased IDs and white labels usually aren't on Spotify, so they show **Not fo
 The scan engine also runs without the GUI:
 
 ```bash
-python scanner.py "My Mix.mp3" --step 90 --show-id      # add --no-verify to skip double-checks
+python scanner.py "My Mix.mp3" --step 90 --show-id      # --no-verify / --no-retry turn the extra lookups off
 python scanner.py "https://soundcloud.com/artist/some-mix"   # downloads first
 python downloader.py "https://www.youtube.com/watch?v=…"     # download only
 ```

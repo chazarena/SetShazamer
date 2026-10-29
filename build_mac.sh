@@ -10,7 +10,7 @@ set -euo pipefail
 
 APP_NAME="SetShazamer"
 BUNDLE_ID="com.setshazamer.app"
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 cd "$(dirname "$0")"
 ROOT="$PWD"
