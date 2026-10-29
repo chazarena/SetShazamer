@@ -65,6 +65,13 @@ APP_NAME = "SetShazamer"
 NEW_PLAYLIST = "+ New playlist…"
 NO_PLAYLISTS = "(connect Spotify)"
 CHECKED, UNCHECKED, NO_CHECK = "☑", "☐", ""
+# Quick-select choices: which confidence levels end up ticked.
+QUICK_SELECT = {
+    "All": {"High", "Medium", "Low"},
+    "Skip Low": {"High", "Medium"},
+    "High only": {"High"},
+    "None": set(),
+}
 CONFIDENCE_LABELS = {"High": "●●● High", "Medium": "●●○ Med", "Low": "●○○ Low"}
 
 if sys.platform == "darwin":
@@ -338,16 +345,22 @@ class SetShazamerApp(ctk.CTk):
         # 6. Export
         export = ctk.CTkFrame(self)
         export.grid(row=5, column=0, padx=16, pady=(8, 16), sticky="ew")
-        export.grid_columnconfigure(0, weight=1)
+        export.grid_columnconfigure(1, weight=1)
         self.count_label = ctk.CTkLabel(export, text="0 unique tracks found", anchor="w",
-                                        font=ctk.CTkFont(weight="bold"))
-        self.count_label.grid(row=0, column=0, padx=12, pady=12, sticky="ew")
+                                        font=ctk.CTkFont(weight="bold"), width=190)
+        self.count_label.grid(row=0, column=0, padx=12, pady=12, sticky="w")
+        quick = ctk.CTkFrame(export, fg_color="transparent")
+        quick.grid(row=0, column=1, padx=6, sticky="w")
+        ctk.CTkLabel(quick, text="Tick:", text_color=MUTED_TEXT).pack(side="left", padx=(0, 6))
+        self.quick_select = ctk.CTkSegmentedButton(
+            quick, values=list(QUICK_SELECT), command=self._quick_select)
+        self.quick_select.pack(side="left")
         ctk.CTkButton(export, text="Copy to Clipboard", width=150,
-                      command=self._copy_clipboard).grid(row=0, column=1, padx=6)
+                      command=self._copy_clipboard).grid(row=0, column=2, padx=6)
         ctk.CTkButton(export, text="Export .TXT", width=120,
-                      command=self._export_txt).grid(row=0, column=2, padx=6)
+                      command=self._export_txt).grid(row=0, column=3, padx=6)
         ctk.CTkButton(export, text="Export .CSV", width=120,
-                      command=self._export_csv).grid(row=0, column=3, padx=(6, 12))
+                      command=self._export_csv).grid(row=0, column=4, padx=(6, 12))
 
     def _style_tree(self, mono: ctk.CTkFont) -> None:
         style = ttk.Style(self)
@@ -715,6 +728,19 @@ class SetShazamerApp(ctk.CTk):
             self._touched.add(entry.uid)
             self._refresh_row(entry)
         self._update_counts()
+
+    def _quick_select(self, choice: str) -> None:
+        keep = QUICK_SELECT.get(choice, set())
+        for entry in self.entries:
+            if entry.unidentified:
+                continue
+            (self.checked.add if entry.confidence in keep else self.checked.discard)(entry.uid)
+            self._touched.add(entry.uid)
+            self._refresh_row(entry)
+        self._update_counts()
+        self.quick_select.set("")  # Acts as buttons, not a lasting mode.
+        ticked = sum(1 for e in self.entries if e.uid in self.checked)
+        self._set_status(f"{choice}: {ticked} track{'s' if ticked != 1 else ''} ticked")
 
     def _on_tree_click(self, event: tk.Event) -> None:
         if self.tree.identify_region(event.x, event.y) not in ("cell", "tree"):
